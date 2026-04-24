@@ -1,6 +1,7 @@
 import os
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 import numpy as np
 from tqdm import tqdm
@@ -34,34 +35,38 @@ def fixed_point_solver(f, x0, max_iter=100, tol=1e-6):
     return x
 
 # ==========================================================
-# 2. BLACK-BOX ROOT FINDER (LIPSWISH ACTIVATION)
+# 2. BLACK-BOX ROOT FINDER (SOFTPLUS BETA-LIPSWISH)
 # ==========================================================
 class ImplicitRootFinder(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, A, B, U, b_x):
+    def forward(ctx, A, B, U, b_x, beta):
         batch = U.shape[1]
         n = A.shape[0]
         X_init = torch.zeros(n, batch, device=U.device)
         
+        # Calculate strictly positive effective beta
+        beta_eff = F.softplus(beta)
+        
         def f(X):
             Z_eq = A @ X + B @ U + b_x
             # Picard Iteration requires the Next State (Contraction Mapping)
-            return (Z_eq * torch.sigmoid(Z_eq)) / 1.1
+            return (Z_eq * torch.sigmoid(beta_eff * Z_eq)) / 1.1
             
         with torch.no_grad():
             X = fixed_point_solver(f, X_init, max_iter=300, tol=1e-7) 
                 
-        ctx.save_for_backward(A, B, X, U, b_x)
+        ctx.save_for_backward(A, B, X, U, b_x, beta, beta_eff)
         return X
 
     @staticmethod
     def backward(ctx, grad_X):
-        A, B, X, U, b_x = ctx.saved_tensors
+        A, B, X, U, b_x, beta, beta_eff = ctx.saved_tensors
         with torch.no_grad():
             Z_eq = A @ X + B @ U + b_x
-            S = torch.sigmoid(Z_eq)
+            S = torch.sigmoid(beta_eff * Z_eq)
             
-            Phi = (S + Z_eq * S * (1.0 - S)) / 1.1 
+            # Exact Derivative w.r.t Z using effective beta
+            Phi = (S + beta_eff * Z_eq * S * (1.0 - S)) / 1.1 
             
             def f_adj(Y):
                 # The adjoint system is also a contraction mapping
@@ -74,7 +79,12 @@ class ImplicitRootFinder(torch.autograd.Function):
             grad_A, grad_B = Phi_Y @ X.T, Phi_Y @ U.T
             grad_U, grad_b_x = B.T @ Phi_Y, Phi_Y.sum(dim=1, keepdim=True)
             
-        return grad_A, grad_B, grad_U, grad_b_x
+            # Exact Derivative w.r.t raw Beta (Chain rule through Softplus)
+            grad_beta_eff = (Z_eq**2 * S * (1.0 - S)) / 1.1
+            grad_beta_raw = grad_beta_eff * torch.sigmoid(beta)
+            grad_beta = (grad_beta_raw * Y).sum(dim=1, keepdim=True)
+            
+        return grad_A, grad_B, grad_U, grad_b_x, grad_beta
 
 # ==========================================================
 # 3. PURE IDL BLOCK (Sequence-Level)
@@ -84,19 +94,23 @@ class PureIDLFlowBlock(nn.Module):
         super().__init__()
         self.p, self.n = p, n
         
-        # [NEW FIX 1] Added n_power_iterations=5 to ensure strict Lipschitz bound
+        # Added n_power_iterations=20 to ensure strict Lipschitz bound
         self.A_layer = nn.utils.spectral_norm(nn.Linear(n, n, bias=False), n_power_iterations=20)
         self.B_layer = nn.utils.spectral_norm(nn.Linear(p, n, bias=False), n_power_iterations=20)
         self.C_layer = nn.utils.spectral_norm(nn.Linear(n, p, bias=False), n_power_iterations=20)
         
         self.b_x = nn.Parameter(torch.zeros(n, 1))
         self.b_y = nn.Parameter(torch.zeros(p, 1))
+        
+        # Initialize learnable beta parameter at 0.5
+        self.beta = nn.Parameter(torch.full((n, 1), 0.5))
+        
         self.register_buffer("D", torch.eye(p))
         
         self.p_A = nn.Parameter(torch.tensor(0.0))
         self.p_B = nn.Parameter(torch.tensor(0.0))
         self.p_C = nn.Parameter(torch.tensor(0.0))
-        self.kappa = 0.95
+        self.kappa = 0.99
         
     def forward(self, u):
         batch = u.shape[0]
@@ -106,19 +120,23 @@ class PureIDLFlowBlock(nn.Module):
         _ = self.B_layer(torch.zeros(1, self.p, device=u.device))
         _ = self.C_layer(torch.zeros(1, self.n, device=u.device))
         
-        alpha, beta, gamma = torch.sigmoid(self.p_A), torch.exp(self.p_B), torch.sigmoid(self.p_C)
+        # Renamed spectral norm beta to beta_weight to avoid shadowing self.beta
+        alpha, beta_weight, gamma = torch.sigmoid(self.p_A), torch.exp(self.p_B), torch.sigmoid(self.p_C)
         A = self.A_layer.weight * (self.kappa * alpha)
-        B = self.B_layer.weight * beta
-        C = self.C_layer.weight * ((self.kappa * (1.0 - alpha) / beta) * gamma)
+        B = self.B_layer.weight * beta_weight
+        C = self.C_layer.weight * ((self.kappa * (1.0 - alpha) / beta_weight) * gamma)
         
-        X = ImplicitRootFinder.apply(A, B, U, self.b_x)
+        # Pass the raw beta into the implicit solver
+        X = ImplicitRootFinder.apply(A, B, U, self.b_x, self.beta)
         
         Y = C @ X + self.D @ U + self.b_y
         y = Y.T 
         
+        # Log-Det calculation with effective beta
+        beta_eff = F.softplus(self.beta)
         Z_eq = A @ X + B @ U + self.b_x
-        S = torch.sigmoid(Z_eq)
-        Phi = (S + Z_eq * S * (1.0 - S)) / 1.1
+        S = torch.sigmoid(beta_eff * Z_eq)
+        Phi = (S + beta_eff * Z_eq * S * (1.0 - S)) / 1.1
         Phi_batch = Phi.T.unsqueeze(-1)
         
         I = torch.eye(self.n, device=u.device).unsqueeze(0).expand(batch, self.n, self.n)
@@ -129,7 +147,7 @@ class PureIDLFlowBlock(nn.Module):
         
         J = C.unsqueeze(0).expand(batch, self.p, self.n) @ V + self.D.unsqueeze(0).expand(batch, self.p, self.p)
         
-        # [NEW FIX 2] Replaced torch.det with slogdet to prevent FP32 underflow
+        # Replaced torch.det with slogdet to prevent FP32 underflow
         sign, logabsdet = torch.linalg.slogdet(J)
         log_det_J = logabsdet
         
@@ -144,18 +162,20 @@ class PureIDLFlowBlock(nn.Module):
         _ = self.B_layer(torch.zeros(1, self.p, device=y.device))
         _ = self.C_layer(torch.zeros(1, self.n, device=y.device))
         
-        alpha, beta, gamma = torch.sigmoid(self.p_A), torch.exp(self.p_B), torch.sigmoid(self.p_C)
+        alpha, beta_weight, gamma = torch.sigmoid(self.p_A), torch.exp(self.p_B), torch.sigmoid(self.p_C)
         A = self.A_layer.weight * (self.kappa * alpha)
-        B = self.B_layer.weight * beta
-        C = self.C_layer.weight * ((self.kappa * (1.0 - alpha) / beta) * gamma)
+        B = self.B_layer.weight * beta_weight
+        C = self.C_layer.weight * ((self.kappa * (1.0 - alpha) / beta_weight) * gamma)
         
         A_tilde, B_tilde = A - B @ C, B 
         b_tilde = self.b_x - B @ self.b_y 
         
+        beta_eff = F.softplus(self.beta)
+        
         def f_inv(X):
             Z_eq = A_tilde @ X + B_tilde @ Y + b_tilde
             # Picard Iteration requires the Next State
-            return (Z_eq * torch.sigmoid(Z_eq)) / 1.1
+            return (Z_eq * torch.sigmoid(beta_eff * Z_eq)) / 1.1
             
         X = fixed_point_solver(f_inv, torch.zeros(self.n, batch, device=y.device), max_iter=300, tol=1e-7)
         return (Y - C @ X - self.b_y).T
@@ -199,7 +219,7 @@ class SequenceIDL(nn.Module):
 class Args_Example:
     def __init__(self) -> None:
         self.config_path = './Config/sines.yaml'
-        self.save_dir = './sines_exp_idl'
+        self.save_dir = './sines_exp_idl_new_2(1)'
         self.gpu = 0
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -218,7 +238,7 @@ def main():
     
     epochs = 300
     
-    # [NEW FIX 3] Added Linear Warmup to protect fragile initial weights
+    # Added Linear Warmup to protect fragile initial weights
     warmup_epochs = 10
     warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
         optimizer, start_factor=0.01, total_iters=warmup_epochs * len(dataloader)
@@ -238,6 +258,9 @@ def main():
         for batch in dataloader:
             X = batch[0].to(device) if isinstance(batch, (list, tuple)) else batch.to(device)
             X = X.float() 
+
+            if model.training:
+                X = X + torch.randn_like(X) * 0.001
             
             optimizer.zero_grad()
             
