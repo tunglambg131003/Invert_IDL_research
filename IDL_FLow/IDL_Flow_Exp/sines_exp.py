@@ -260,7 +260,7 @@ def main():
             X = X.float() 
 
             if model.training:
-                X = X + torch.randn_like(X) * 0.001
+                X = X + torch.randn_like(X) * 0.01
             
             optimizer.zero_grad()
             
