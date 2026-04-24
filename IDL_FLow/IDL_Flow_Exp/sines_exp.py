@@ -236,7 +236,7 @@ def main():
     model = SequenceIDL(seq_len=seq_length, dim=feature_dim, n_flow=256, num_layers=12).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-5)
     
-    epochs = 300
+    epochs = 500
     
     # Added Linear Warmup to protect fragile initial weights
     warmup_epochs = 10
