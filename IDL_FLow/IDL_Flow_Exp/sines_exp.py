@@ -10,8 +10,8 @@ from tqdm import tqdm
 from Data.build_dataloader import build_dataloader
 from Utils.io_utils import load_yaml_config
 from Models.interpretable_diffusion.model_utils import unnormalize_to_zero_to_one
-from Utils.context_fid import Context_FID
-from Utils.discriminative_metric import discriminative_score_metrics
+
+torch.backends.cuda.preferred_linalg_library("cusolver")
 
 # ==========================================================
 # 1. FIXED-POINT SOLVER (PICARD ITERATION)
@@ -53,7 +53,7 @@ class ImplicitRootFinder(torch.autograd.Function):
             return (Z_eq * torch.sigmoid(beta_eff * Z_eq)) / 1.1
             
         with torch.no_grad():
-            X = fixed_point_solver(f, X_init, max_iter=300, tol=1e-7) 
+            X = fixed_point_solver(f, X_init, max_iter=500, tol=1e-9) 
                 
         ctx.save_for_backward(A, B, X, U, b_x, beta, beta_eff)
         return X
@@ -73,7 +73,7 @@ class ImplicitRootFinder(torch.autograd.Function):
                 return grad_X + A.T @ (Phi * Y)
                 
             Y_init = torch.zeros_like(grad_X)
-            Y = fixed_point_solver(f_adj, Y_init, max_iter=300, tol=1e-10)
+            Y = fixed_point_solver(f_adj, Y_init, max_iter=500, tol=1e-10)
                 
             Phi_Y = Phi * Y
             grad_A, grad_B = Phi_Y @ X.T, Phi_Y @ U.T
@@ -141,7 +141,7 @@ class PureIDLFlowBlock(nn.Module):
         
         I = torch.eye(self.n, device=u.device).unsqueeze(0).expand(batch, self.n, self.n)
         A_eff = I - Phi_batch * A.unsqueeze(0)
-        A_eff = A_eff + torch.eye(self.n, device=u.device).unsqueeze(0) * 1e-4 
+        A_eff = A_eff + torch.eye(self.n, device=u.device).unsqueeze(0) * 1e-5
         
         V = torch.linalg.solve(A_eff, Phi_batch * B.unsqueeze(0))
         
@@ -177,7 +177,7 @@ class PureIDLFlowBlock(nn.Module):
             # Picard Iteration requires the Next State
             return (Z_eq * torch.sigmoid(beta_eff * Z_eq)) / 1.1
             
-        X = fixed_point_solver(f_inv, torch.zeros(self.n, batch, device=y.device), max_iter=300, tol=1e-7)
+        X = fixed_point_solver(f_inv, torch.zeros(self.n, batch, device=y.device), max_iter=500, tol=1e-10)
         return (Y - C @ X - self.b_y).T
 
 # ==========================================================
@@ -213,13 +213,33 @@ class SequenceIDL(nn.Module):
             
         return z.view(batch_size, self.seq_len, self.dim)
 
+class EarlyStopping:
+    def __init__(self, patience=25, min_delta=1e-4, save_path='best_idl_model.pth'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.save_path = save_path
+        self.counter = 0
+        self.best_loss = float('inf')
+        self.early_stop = False
+
+    def __call__(self, current_loss, model):
+        if current_loss < self.best_loss - self.min_delta:
+            self.best_loss = current_loss
+            self.counter = 0
+            # Save the absolute best weights
+            torch.save(model.state_dict(), self.save_path)
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+
 # ==========================================================
 # 5. DIFFUSION-TS INTEGRATION SCRIPT
 # ==========================================================
 class Args_Example:
     def __init__(self) -> None:
         self.config_path = './Config/sines.yaml'
-        self.save_dir = './sines_exp_idl_new_2(1)'
+        self.save_dir = './sines_exp_idl'
         self.gpu = 0
         os.makedirs(self.save_dir, exist_ok=True)
 
@@ -234,9 +254,9 @@ def main():
     seq_length, feature_dim = dataset.window, dataset.var_num
 
     model = SequenceIDL(seq_len=seq_length, dim=feature_dim, n_flow=256, num_layers=12).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-5)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.003, weight_decay=1e-6)
     
-    epochs = 500
+    epochs = 350
     
     # Added Linear Warmup to protect fragile initial weights
     warmup_epochs = 10
@@ -244,12 +264,15 @@ def main():
         optimizer, start_factor=0.01, total_iters=warmup_epochs * len(dataloader)
     )
     cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=(epochs - warmup_epochs) * len(dataloader), eta_min=1e-5
+        optimizer, T_max=(epochs - warmup_epochs) * len(dataloader), eta_min=1e-6
     )
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_scheduler, cosine_scheduler], 
         milestones=[warmup_epochs * len(dataloader)]
     )
+
+    model_save_path = os.path.join(args.save_dir, 'best_idl_model.pth')
+    early_stopping = EarlyStopping(patience=25, min_delta=1e-5, save_path=model_save_path)
     
     print(f"--- Training Joint Sequence IDL on {feature_dim}-D Sines Dataset ---")
     model.train()
@@ -260,7 +283,7 @@ def main():
             X = X.float() 
 
             if model.training:
-                X = X + torch.randn_like(X) * 0.01
+                X = X + torch.randn_like(X) * 0.005
             
             optimizer.zero_grad()
             
@@ -275,9 +298,18 @@ def main():
             
             epoch_loss += nll.item()
             
+        avg_epoch_loss = epoch_loss / len(dataloader)
         if (epoch + 1) % 1 == 0:
-            print(f"Epoch {epoch+1}/{epochs} | Loss: {epoch_loss/len(dataloader):.4f}")
+            print(f"Epoch {epoch+1}/{epochs} | Loss: {avg_epoch_loss:.4f}")
 
+        early_stopping(avg_epoch_loss, model)
+        if early_stopping.early_stop:
+            print(f"\n--- Early stopping triggered at Epoch {epoch+1}! ---")
+            break
+
+    if os.path.exists(model_save_path):
+        model.load_state_dict(torch.load(model_save_path))
+        
     print("\n--- Generating Fake Data (Simultaneous Pass) ---")
     chunk_size = 5000 
     num_samples = len(dataset)
